@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Sheet Number</Name>
+    <Assembly>SheetNumber\SheetNumber.dll</Assembly>
+    <FullClassName>SheetNumber.App</FullClassName>
+    <ClientId>c4e8a1b2-7d63-4f09-9a55-2b6e8d0c1f73</ClientId>
+    <VendorId>EGIS</VendorId>
+    <VendorDescription>EGIS Group</VendorDescription>
+  </AddIn>
+</RevitAddIns>
