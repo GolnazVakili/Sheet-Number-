@@ -13,19 +13,21 @@ public sealed class SheetNumberCatalog
 
 public sealed class SheetNumberRequest
 {
-    public required string MainParameter { get; init; }
+    public required string SourceParameter { get; init; }
 
     public required string DestinationParameter { get; init; }
 
-    public required string FirstPrefixParameter { get; init; }
+    public required string PrefixTargetParameter { get; init; }
 
-    public required string SecondPrefixParameter { get; init; }
+    public required IReadOnlyList<string> PrefixParameters { get; init; }
 
     public bool SkipIfAlreadyPrefixed { get; init; }
 }
 
 public sealed class SheetNumberApplyResult
 {
+    public required int SheetTotal { get; init; }
+
     public required int Updated { get; init; }
 
     public required int SkippedPrefixed { get; init; }

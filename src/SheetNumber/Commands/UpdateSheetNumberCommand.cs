@@ -64,25 +64,31 @@ public class UpdateSheetNumberCommand : IExternalCommand
         }
         else
         {
-            lines.Add(result.Updated == 1
-                ? "Updated 1 sheet."
-                : $"Updated {result.Updated} sheets.");
-            lines.Add($"{request.DestinationParameter} now stores the previous {request.MainParameter}.");
-            lines.Add($"{request.MainParameter} now starts with {request.FirstPrefixParameter} and {request.SecondPrefixParameter}.");
+            lines.Add($"Updated {result.Updated} of {result.SheetTotal} sheets in this project.");
+            string prefixes = string.Join(" and ", request.PrefixParameters);
+            if (string.Equals(request.PrefixTargetParameter, request.DestinationParameter, StringComparison.OrdinalIgnoreCase))
+            {
+                lines.Add($"{request.DestinationParameter} now stores {prefixes} in front of {request.SourceParameter}.");
+            }
+            else
+            {
+                lines.Add($"{request.DestinationParameter} now stores {request.SourceParameter}.");
+                lines.Add($"{request.PrefixTargetParameter} now starts with {prefixes}.");
+            }
         }
 
         if (result.SkippedPrefixed > 0)
         {
             lines.Add(result.SkippedPrefixed == 1
-                ? "Skipped 1 sheet that already started with this prefix."
-                : $"Skipped {result.SkippedPrefixed} sheets that already started with this prefix.");
+                ? "Skipped 1 sheet whose destination already had this value."
+                : $"Skipped {result.SkippedPrefixed} sheets whose destination already had this value.");
         }
 
         if (result.SkippedEmpty > 0)
         {
             lines.Add(result.SkippedEmpty == 1
-                ? $"Skipped 1 sheet with an empty {request.MainParameter}."
-                : $"Skipped {result.SkippedEmpty} sheets with an empty {request.MainParameter}.");
+                ? $"Skipped 1 sheet with an empty {request.SourceParameter}."
+                : $"Skipped {result.SkippedEmpty} sheets with an empty {request.SourceParameter}.");
         }
 
         if (result.Failures.Count > 0)

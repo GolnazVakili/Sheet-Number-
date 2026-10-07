@@ -6,7 +6,11 @@ namespace SheetNumber.UI;
 
 public partial class SheetNumberWindow : Window
 {
+    private const int MinimumPrefixCount = 1;
+    private const int MaximumPrefixCount = 3;
+
     private readonly SheetNumberCatalog _catalog;
+    private readonly List<PrefixRow> _prefixRows = [];
 
     public SheetNumberRequest? Request { get; private set; }
 
@@ -15,67 +19,165 @@ public partial class SheetNumberWindow : Window
         _catalog = catalog;
         InitializeComponent();
 
-        MainParameterCombo.ItemsSource = catalog.ParameterNames;
+        SourceParameterCombo.ItemsSource = catalog.ParameterNames;
         DestinationParameterCombo.ItemsSource = catalog.ParameterNames;
-        FirstPrefixCombo.ItemsSource = catalog.ParameterNames;
-        SecondPrefixCombo.ItemsSource = catalog.ParameterNames;
+        PrefixTargetCombo.ItemsSource = catalog.ParameterNames;
 
-        Select(MainParameterCombo, name => name.Equals("Sheet Number", StringComparison.OrdinalIgnoreCase));
+        Select(SourceParameterCombo, name => name.Equals("Sheet Number", StringComparison.OrdinalIgnoreCase));
         Select(DestinationParameterCombo, name => name.Equals("SheetNumber2", StringComparison.OrdinalIgnoreCase));
-        Select(FirstPrefixCombo, name => IsDisciplineOriginator(name) && !IsSubDiscipline(name));
-        Select(SecondPrefixCombo, IsSubDiscipline);
+        Select(PrefixTargetCombo, name => name.Equals("Sheet Number", StringComparison.OrdinalIgnoreCase));
+        AddPrefixRow(name => IsDisciplineOriginator(name) && !IsSubDiscipline(name));
+        AddPrefixRow(IsSubDiscipline);
 
         SkipPrefixedCheckBox.IsChecked = true;
-        SheetCountText.Text = catalog.SheetCount == 1
-            ? "Applies to 1 sheet. One undo reverses it."
-            : $"Applies to {catalog.SheetCount} sheets. One undo reverses them.";
 
-        MainParameterCombo.SelectionChanged += (_, _) => UpdatePreview();
-        DestinationParameterCombo.SelectionChanged += (_, _) => UpdatePreview();
-        FirstPrefixCombo.SelectionChanged += (_, _) => UpdatePreview();
-        SecondPrefixCombo.SelectionChanged += (_, _) => UpdatePreview();
-        SkipPrefixedCheckBox.Checked += (_, _) => UpdatePreview();
-        SkipPrefixedCheckBox.Unchecked += (_, _) => UpdatePreview();
+        SourceParameterCombo.SelectionChanged += (_, _) => RefreshPreviewIfOpen();
+        DestinationParameterCombo.SelectionChanged += (_, _) => RefreshPreviewIfOpen();
+        PrefixTargetCombo.SelectionChanged += (_, _) => RefreshPreviewIfOpen();
+        SkipPrefixedCheckBox.Checked += (_, _) => RefreshPreviewIfOpen();
+        SkipPrefixedCheckBox.Unchecked += (_, _) => RefreshPreviewIfOpen();
 
         ApplyButton.IsEnabled = catalog.SheetCount > 0;
+    }
+
+    private void AddPrefix_Click(object sender, RoutedEventArgs e)
+    {
+        AddPrefixRow(null);
+        RefreshPreviewIfOpen();
+    }
+
+    private void AddPrefixRow(Func<string, bool>? prefer)
+    {
+        if (_prefixRows.Count >= MaximumPrefixCount)
+            return;
+
+        var combo = new ComboBox
+        {
+            Height = 28,
+            MaxDropDownHeight = 360,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        combo.ItemsSource = _catalog.ParameterNames;
+        combo.SelectionChanged += (_, _) => RefreshPreviewIfOpen();
+        if (prefer != null)
+            Select(combo, prefer);
+
+        var remove = new Button
+        {
+            Content = "Remove",
+            Width = 76,
+            Height = 28,
+            Margin = new Thickness(8, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Bottom
+        };
+
+        var row = new PrefixRow(combo, remove);
+        remove.Click += (_, _) => RemovePrefixRow(row);
+
+        var grid = new Grid { Margin = new Thickness(0, 0, 0, 8) };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.Children.Add(combo);
+        Grid.SetColumn(remove, 1);
+        grid.Children.Add(remove);
+        row.Panel = grid;
+
+        _prefixRows.Add(row);
+        PrefixRows.Children.Add(grid);
+        UpdatePrefixButtons();
+    }
+
+    private void RemovePrefixRow(PrefixRow row)
+    {
+        if (_prefixRows.Count <= MinimumPrefixCount)
+            return;
+
+        _prefixRows.Remove(row);
+        PrefixRows.Children.Remove(row.Panel);
+        UpdatePrefixButtons();
+        RefreshPreviewIfOpen();
+    }
+
+    private void UpdatePrefixButtons()
+    {
+        bool canRemove = _prefixRows.Count > MinimumPrefixCount;
+        foreach (PrefixRow row in _prefixRows)
+            row.RemoveButton.IsEnabled = canRemove;
+
+        AddPrefixButton.IsEnabled = _prefixRows.Count < MaximumPrefixCount;
+    }
+
+    private void Preview_Click(object sender, RoutedEventArgs e)
+    {
+        if (!TryReadSelection(out _, out _, out _, out _))
+            return;
+
+        PreviewBorder.Visibility = Visibility.Visible;
         UpdatePreview();
+    }
+
+    private void RefreshPreviewIfOpen()
+    {
+        if (PreviewBorder.Visibility == Visibility.Visible)
+            UpdatePreview();
     }
 
     private void Apply_Click(object sender, RoutedEventArgs e)
     {
-        if (MainParameterCombo.SelectedItem is not string main
-            || DestinationParameterCombo.SelectedItem is not string destination
-            || FirstPrefixCombo.SelectedItem is not string first
-            || SecondPrefixCombo.SelectedItem is not string second)
-        {
-            MessageBox.Show(this, "Choose all four parameters before applying.", "Sheet Number", MessageBoxButton.OK, MessageBoxImage.Information);
+        if (!TryReadSelection(out string? source, out string? destination, out string? prefixTarget, out IReadOnlyList<string>? prefixes))
             return;
-        }
-
-        if (string.Equals(main, destination, StringComparison.OrdinalIgnoreCase))
-        {
-            MessageBox.Show(this, "Main Parameter and Destination Parameter have to be different.", "Sheet Number", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
 
         Request = new SheetNumberRequest
         {
-            MainParameter = main,
-            DestinationParameter = destination,
-            FirstPrefixParameter = first,
-            SecondPrefixParameter = second,
+            SourceParameter = source!,
+            DestinationParameter = destination!,
+            PrefixTargetParameter = prefixTarget!,
+            PrefixParameters = prefixes!,
             SkipIfAlreadyPrefixed = SkipPrefixedCheckBox.IsChecked == true
         };
 
         DialogResult = true;
     }
 
+    private bool TryReadSelection(out string? source, out string? destination, out string? prefixTarget, out IReadOnlyList<string>? prefixes)
+    {
+        source = SourceParameterCombo.SelectedItem as string;
+        destination = DestinationParameterCombo.SelectedItem as string;
+        prefixTarget = PrefixTargetCombo.SelectedItem as string;
+        var selectedPrefixes = new List<string>();
+        foreach (PrefixRow row in _prefixRows)
+        {
+            if (row.Combo.SelectedItem is string name)
+                selectedPrefixes.Add(name);
+        }
+
+        prefixes = selectedPrefixes;
+
+        if (source == null || destination == null || prefixTarget == null || selectedPrefixes.Count != _prefixRows.Count)
+        {
+            MessageBox.Show(this, "Choose a parameter in every list.", "Sheet Number", MessageBoxButton.OK, MessageBoxImage.Information);
+            return false;
+        }
+
+        if (string.Equals(source, destination, StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, "Source Parameter and Destination Parameter have to be different.", "Sheet Number", MessageBoxButton.OK, MessageBoxImage.Information);
+            return false;
+        }
+
+        return true;
+    }
+
     private void UpdatePreview()
     {
-        string? main = MainParameterCombo.SelectedItem as string;
+        string? source = SourceParameterCombo.SelectedItem as string;
         string? destination = DestinationParameterCombo.SelectedItem as string;
-        string? first = FirstPrefixCombo.SelectedItem as string;
-        string? second = SecondPrefixCombo.SelectedItem as string;
+        string? prefixTarget = PrefixTargetCombo.SelectedItem as string;
+        IReadOnlyList<string> prefixes = _prefixRows
+            .Select(row => row.Combo.SelectedItem as string)
+            .Where(name => !string.IsNullOrEmpty(name))
+            .Cast<string>()
+            .ToList();
 
         if (string.IsNullOrEmpty(_catalog.PreviewSheetLabel))
         {
@@ -83,42 +185,54 @@ public partial class SheetNumberWindow : Window
             return;
         }
 
+        string sourceLabel = source ?? "Source Parameter";
         string destLabel = destination ?? "Destination Parameter";
-        string mainLabel = main ?? "Main Parameter";
+        string targetLabel = prefixTarget ?? "Parameter";
+        bool targetIsDestination = string.Equals(prefixTarget, destination, StringComparison.OrdinalIgnoreCase);
         var lines = new List<string> { _catalog.PreviewSheetLabel };
 
-        if (string.IsNullOrEmpty(main) || !_catalog.PreviewValues.TryGetValue(main, out string? current))
+        if (string.IsNullOrEmpty(source) || !_catalog.PreviewValues.TryGetValue(source, out string? sourceValue))
         {
-            string missing = string.IsNullOrEmpty(main) ? "(choose a parameter)" : "(not found on this sheet)";
+            string missing = string.IsNullOrEmpty(source) ? "(choose a parameter)" : "(not found on this sheet)";
+            lines.Add($"{sourceLabel}  =  {missing}");
             lines.Add($"{destLabel}  =  {missing}");
-            lines.Add($"{mainLabel}  =  {missing}");
             PreviewText.Text = string.Join(Environment.NewLine, lines);
             return;
         }
 
-        if (current.Length == 0)
+        string targetValue = targetIsDestination ? sourceValue : RawValue(_catalog, prefixTarget);
+        if (string.IsNullOrEmpty(targetIsDestination ? sourceValue : targetValue))
         {
-            lines.Add($"{destLabel}  =  (empty)");
-            lines.Add($"{mainLabel}  =  (empty)");
-            lines.Add("This sheet will be skipped because the main parameter is empty.");
+            lines.Add($"{targetLabel}  =  (empty)");
+            lines.Add("This sheet will be skipped because the parameter is empty.");
             PreviewText.Text = string.Join(Environment.NewLine, lines);
             return;
         }
 
-        string prefix = RawValue(_catalog, first) + RawValue(_catalog, second);
-        lines.Add($"{destLabel}  =  {current}");
-        lines.Add($"{mainLabel}  =  {prefix}{current}");
+        string prefix = string.Concat(prefixes.Select(name => RawValue(_catalog, name)));
+        string updated = prefix + (targetIsDestination ? sourceValue : targetValue);
+        if (targetIsDestination)
+        {
+            lines.Add($"{sourceLabel}  =  {sourceValue}");
+            lines.Add($"{destLabel}  =  {updated}");
+        }
+        else
+        {
+            lines.Add($"{destLabel}  =  {sourceValue}");
+            lines.Add($"{targetLabel}  =  {updated}");
+        }
 
-        if (!string.IsNullOrEmpty(first) && !_catalog.PreviewValues.ContainsKey(first))
-            lines.Add($"{first} was not found on this sheet.");
-        if (!string.IsNullOrEmpty(second) && !_catalog.PreviewValues.ContainsKey(second))
-            lines.Add($"{second} was not found on this sheet.");
+        foreach (string name in prefixes)
+        {
+            if (!_catalog.PreviewValues.ContainsKey(name))
+                lines.Add($"{name} was not found on this sheet.");
+        }
 
         if (SkipPrefixedCheckBox.IsChecked == true
-            && prefix.Length > 0
-            && current.StartsWith(prefix, StringComparison.Ordinal))
+            && _catalog.PreviewValues.TryGetValue(targetLabel, out string? existingTarget)
+            && string.Equals(existingTarget, updated, StringComparison.Ordinal))
         {
-            lines.Add("This sheet already starts with the prefix, so it will be skipped.");
+            lines.Add("This sheet already has this value, so it will be skipped.");
         }
 
         PreviewText.Text = string.Join(Environment.NewLine, lines);
@@ -150,5 +264,12 @@ public partial class SheetNumberWindow : Window
         return name.Contains("Discipline", StringComparison.OrdinalIgnoreCase)
                && (name.Contains("Originator", StringComparison.OrdinalIgnoreCase)
                    || name.Contains("Orginator", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private sealed class PrefixRow(ComboBox combo, Button removeButton)
+    {
+        public ComboBox Combo { get; } = combo;
+        public Button RemoveButton { get; } = removeButton;
+        public Grid Panel { get; set; } = new();
     }
 }

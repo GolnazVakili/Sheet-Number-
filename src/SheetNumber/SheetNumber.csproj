@@ -36,9 +36,9 @@
       <AddinDir>$(AppData)\Autodesk\Revit\Addins\2025\SheetNumber</AddinDir>
     </PropertyGroup>
     <MakeDir Directories="$(AddinDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(AddinDir)" SkipUnchangedFiles="false" ContinueOnError="true" />
-    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(AddinDir)" SkipUnchangedFiles="false" ContinueOnError="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
-    <Copy SourceFiles="$(ProjectDir)SheetNumber.addin" DestinationFolder="$(AppData)\Autodesk\Revit\Addins\2025" SkipUnchangedFiles="false" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(AddinDir)" SkipUnchangedFiles="false" Retries="1" RetryDelayMilliseconds="300" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(AddinDir)" SkipUnchangedFiles="false" Retries="1" RetryDelayMilliseconds="300" ContinueOnError="true" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+    <Copy SourceFiles="$(ProjectDir)SheetNumber.addin" DestinationFolder="$(AppData)\Autodesk\Revit\Addins\2025" SkipUnchangedFiles="false" Retries="1" RetryDelayMilliseconds="300" ContinueOnError="true" />
   </Target>
 
 </Project>

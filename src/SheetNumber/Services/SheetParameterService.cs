@@ -8,40 +8,16 @@ public static class SheetParameterService
 {
     public static SheetNumberCatalog Load(Document doc, ViewSheet? activeSheet)
     {
-        var names = new SortedSet<string>(StringComparer.CurrentCultureIgnoreCase);
         List<ViewSheet> sheets = CollectSheets(doc);
-
-        if (sheets.Count > 0)
-            CollectNames(sheets[0], names);
-
-        foreach (Element instance in new FilteredElementCollector(doc)
-                     .OfCategory(BuiltInCategory.OST_TitleBlocks)
-                     .WhereElementIsNotElementType())
-        {
-            CollectNames(instance, names);
-        }
-
-        foreach (Element type in new FilteredElementCollector(doc)
-                     .OfCategory(BuiltInCategory.OST_TitleBlocks)
-                     .WhereElementIsElementType())
-        {
-            CollectNames(type, names);
-        }
-
-        if (doc.ProjectInformation != null)
-            CollectNames(doc.ProjectInformation, names);
-
         ViewSheet? previewSheet = ResolvePreviewSheet(activeSheet, sheets);
+        IReadOnlySet<string> names = CollectSheetParameterNames(doc, previewSheet ?? sheets.FirstOrDefault());
         Dictionary<string, string> previewValues = previewSheet == null
             ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-            : ReadAll(doc, previewSheet);
-
-        foreach (string name in previewValues.Keys)
-            names.Add(name);
+            : ReadAll(previewSheet);
 
         return new SheetNumberCatalog
         {
-            ParameterNames = names.ToList(),
+            ParameterNames = names.OrderBy(name => name, StringComparer.CurrentCultureIgnoreCase).ToList(),
             SheetCount = sheets.Count,
             PreviewSheetLabel = previewSheet == null ? null : SheetLabel(previewSheet),
             PreviewValues = previewValues
@@ -55,6 +31,7 @@ public static class SheetParameterService
         int skippedPrefixed = 0;
         int skippedEmpty = 0;
         var failures = new List<string>();
+        var plans = new List<SheetPlan>();
 
         using var transaction = new Transaction(doc, "Update sheet numbers");
         transaction.Start();
@@ -62,32 +39,74 @@ public static class SheetParameterService
         options.SetFailuresPreprocessor(new QuietWarnings());
         transaction.SetFailureHandlingOptions(options);
 
-        foreach (ViewSheet sheet in sheets)
+        if (doc.IsWorkshared)
         {
-            string label = SheetLabel(sheet);
             try
             {
-                switch (UpdateSheet(doc, sheet, request, out string? failure))
-                {
-                    case UpdateStatus.Updated:
-                        updated++;
-                        break;
-                    case UpdateStatus.SkippedPrefixed:
-                        skippedPrefixed++;
-                        break;
-                    case UpdateStatus.SkippedEmpty:
-                        skippedEmpty++;
-                        break;
-                    default:
-                        failures.Add($"{label}: {failure}");
-                        break;
-                }
+                WorksharingUtils.CheckoutElements(doc, sheets.Select(sheet => sheet.Id).ToList());
+            }
+            catch
+            {
+                // Sheets that cannot be checked out are reported individually.
+            }
+        }
+
+        foreach (ViewSheet sheet in sheets)
+            plans.Add(PlanSheet(doc, sheet, request));
+
+        foreach (SheetPlan plan in plans.Where(plan => plan.SetSheetNumber && plan.Status == UpdateStatus.Updated))
+        {
+            try
+            {
+                plan.Sheet.SheetNumber = "TMP" + plan.Sheet.Id.Value.ToString(CultureInfo.InvariantCulture);
             }
             catch (Exception ex)
             {
-                failures.Add($"{label}: {ex.Message}");
+                plan.Status = UpdateStatus.Failed;
+                plan.Failure = ex.Message;
             }
         }
+
+        if (plans.Any(plan => plan.SetSheetNumber && plan.Status == UpdateStatus.Updated))
+            doc.Regenerate();
+
+        foreach (SheetPlan plan in plans)
+        {
+            switch (plan.Status)
+            {
+                case UpdateStatus.SkippedPrefixed:
+                    skippedPrefixed++;
+                    continue;
+                case UpdateStatus.SkippedEmpty:
+                    skippedEmpty++;
+                    continue;
+                case UpdateStatus.Failed:
+                    failures.Add($"{plan.Label}: {plan.Failure}");
+                    continue;
+            }
+
+            using var subTransaction = new SubTransaction(doc);
+            subTransaction.Start();
+            if (TryApplyPlan(plan, out string? failure))
+            {
+                subTransaction.Commit();
+                updated++;
+            }
+            else
+            {
+                subTransaction.RollBack();
+                if (plan.SetSheetNumber)
+                {
+                    try { plan.Sheet.SheetNumber = plan.OriginalSheetNumber; }
+                    catch { /* The temporary number is rolled back with the transaction if this sheet was not committed. */ }
+                }
+
+                failures.Add($"{plan.Label}: {failure}");
+            }
+        }
+
+        if (updated > 0)
+            doc.Regenerate();
 
         bool committed = false;
         if (updated > 0)
@@ -102,6 +121,7 @@ public static class SheetParameterService
 
         return new SheetNumberApplyResult
         {
+            SheetTotal = sheets.Count,
             Updated = updated,
             SkippedPrefixed = skippedPrefixed,
             SkippedEmpty = skippedEmpty,
@@ -110,75 +130,152 @@ public static class SheetParameterService
         };
     }
 
-    private static UpdateStatus UpdateSheet(Document doc, ViewSheet sheet, SheetNumberRequest request, out string? failure)
+    private static SheetPlan PlanSheet(Document doc, ViewSheet sheet, SheetNumberRequest request)
+    {
+        var plan = new SheetPlan
+        {
+            Sheet = sheet,
+            Label = SheetLabel(sheet),
+            OriginalSheetNumber = sheet.SheetNumber ?? ""
+        };
+
+        List<ParamHit> sourceHits = FindHits(doc, sheet, request.SourceParameter);
+        List<ParamHit> destinationHits = FindHits(doc, sheet, request.DestinationParameter);
+        List<ParamHit> targetHits = FindHits(doc, sheet, request.PrefixTargetParameter);
+        bool targetIsDestination = NamesEqual(request.PrefixTargetParameter, request.DestinationParameter);
+
+        ParamHit? source = Prefer(sourceHits, writable: false);
+        if (source == null)
+        {
+            plan.Status = UpdateStatus.Failed;
+            plan.Failure = $"Could not find {request.SourceParameter} on this sheet.";
+            return plan;
+        }
+
+        List<Parameter> destinationParameters = WritableParameters(destinationHits);
+        if (destinationParameters.Count == 0)
+        {
+            plan.Status = UpdateStatus.Failed;
+            plan.Failure = DescribeMissing(request.DestinationParameter, destinationHits);
+            return plan;
+        }
+
+        List<Parameter> targetParameters = targetIsDestination
+            ? destinationParameters
+            : WritableParameters(targetHits);
+        if (targetParameters.Count == 0)
+        {
+            plan.Status = UpdateStatus.Failed;
+            plan.Failure = DescribeMissing(request.PrefixTargetParameter, targetHits);
+            return plan;
+        }
+
+        var prefixParts = new List<string>(request.PrefixParameters.Count);
+        foreach (string parameterName in request.PrefixParameters)
+        {
+            List<ParamHit> hits = FindHits(doc, sheet, parameterName);
+            if (hits.Count == 0)
+            {
+                plan.Status = UpdateStatus.Failed;
+                plan.Failure = $"Could not find {parameterName} on this sheet.";
+                return plan;
+            }
+
+            prefixParts.Add(Prefer(hits, writable: false)?.Value ?? "");
+        }
+
+        string sourceValue = source.Value;
+        ParamHit? prefixTarget = targetIsDestination
+            ? Prefer(destinationHits, writable: false)
+            : Prefer(targetHits, writable: false);
+        string baseValue = targetIsDestination ? sourceValue : prefixTarget?.Value ?? "";
+        if (string.IsNullOrEmpty(baseValue))
+        {
+            plan.Status = UpdateStatus.SkippedEmpty;
+            return plan;
+        }
+
+        string updated = string.Concat(prefixParts) + baseValue;
+        string existingTarget = targetIsDestination ? destinationHits.First().Value : prefixTarget?.Value ?? "";
+        if (request.SkipIfAlreadyPrefixed && string.Equals(existingTarget, updated, StringComparison.Ordinal))
+        {
+            plan.Status = UpdateStatus.SkippedPrefixed;
+            return plan;
+        }
+
+        plan.Status = UpdateStatus.Updated;
+        plan.TargetParameters = targetParameters;
+        plan.TargetValue = updated;
+        plan.SetSheetNumber = targetParameters.Any(IsBuiltInSheetNumber) || destinationParameters.Any(IsBuiltInSheetNumber) && targetIsDestination;
+        if (targetParameters.Any(IsBuiltInSheetNumber))
+        {
+            plan.SetSheetNumber = true;
+            plan.NewSheetNumber = updated;
+        }
+
+        if (!targetIsDestination)
+        {
+            plan.WriteDestination = true;
+            plan.DestinationParameters = destinationParameters.Where(parameter => !IsBuiltInSheetNumber(parameter)).ToList();
+            plan.DestinationValue = sourceValue;
+            if (destinationParameters.Any(IsBuiltInSheetNumber))
+            {
+                plan.SetSheetNumber = true;
+                plan.NewSheetNumber = sourceValue;
+            }
+        }
+
+        return plan;
+    }
+
+    private static bool TryApplyPlan(SheetPlan plan, out string? failure)
     {
         failure = null;
-
-        List<ParamHit> mainHits = FindHits(doc, sheet, request.MainParameter);
-        List<ParamHit> destinationHits = FindHits(doc, sheet, request.DestinationParameter);
-        List<ParamHit> firstHits = FindHits(doc, sheet, request.FirstPrefixParameter);
-        List<ParamHit> secondHits = FindHits(doc, sheet, request.SecondPrefixParameter);
-
-        ParamHit? main = Prefer(mainHits, writable: true);
-        if (main == null)
+        if (plan.WriteDestination)
         {
-            failure = DescribeMissing(request.MainParameter, mainHits);
-            return UpdateStatus.Failed;
+            foreach (Parameter parameter in plan.DestinationParameters)
+            {
+                if (!TrySet(parameter, plan.DestinationValue, out string? copyError))
+                {
+                    failure = $"Could not write the destination parameter. {copyError}";
+                    return false;
+                }
+            }
         }
 
-        ParamHit? destination = Prefer(destinationHits, writable: true);
-        if (destination == null)
+        if (plan.SetSheetNumber && !string.IsNullOrEmpty(plan.NewSheetNumber))
         {
-            failure = DescribeMissing(request.DestinationParameter, destinationHits);
-            return UpdateStatus.Failed;
+            try
+            {
+                plan.Sheet.SheetNumber = plan.NewSheetNumber;
+            }
+            catch (Exception ex)
+            {
+                failure = ex.Message;
+                return false;
+            }
         }
 
-        if (firstHits.Count == 0)
+        foreach (Parameter parameter in plan.TargetParameters.Where(parameter => !IsBuiltInSheetNumber(parameter)))
         {
-            failure = $"Could not find {request.FirstPrefixParameter} on this sheet.";
-            return UpdateStatus.Failed;
+            if (!TrySet(parameter, plan.TargetValue, out string? writeError))
+            {
+                failure = $"Could not write the prefixed parameter. {writeError}";
+                return false;
+            }
         }
 
-        if (secondHits.Count == 0)
-        {
-            failure = $"Could not find {request.SecondPrefixParameter} on this sheet.";
-            return UpdateStatus.Failed;
-        }
+        return true;
+    }
 
-        string current = Prefer(mainHits, writable: false)?.Value ?? "";
-        if (string.IsNullOrEmpty(current))
-            return UpdateStatus.SkippedEmpty;
-
-        string first = Prefer(firstHits, writable: false)?.Value ?? "";
-        string second = Prefer(secondHits, writable: false)?.Value ?? "";
-        string prefix = first + second;
-
-        if (request.SkipIfAlreadyPrefixed
-            && prefix.Length > 0
-            && current.StartsWith(prefix, StringComparison.Ordinal))
-        {
-            return UpdateStatus.SkippedPrefixed;
-        }
-
-        string updated = prefix + current;
-        string previousDestination = destination.Value;
-
-        // Copy the current value first so the original sheet number is kept,
-        // then write the prefixed value back to the main parameter.
-        if (!TrySet(destination.Parameter, current, out string? copyError))
-        {
-            failure = $"Could not write {request.DestinationParameter}. {copyError}";
-            return UpdateStatus.Failed;
-        }
-
-        if (!TrySet(main.Parameter, updated, out string? prefixError))
-        {
-            TrySet(destination.Parameter, previousDestination, out _);
-            failure = $"Could not write {request.MainParameter}. {prefixError}";
-            return UpdateStatus.Failed;
-        }
-
-        return UpdateStatus.Updated;
+    private static List<Parameter> WritableParameters(List<ParamHit> hits)
+    {
+        return hits
+            .Where(hit => !hit.Parameter.IsReadOnly && !IsTypeParameter(hit.Parameter))
+            .Select(hit => hit.Parameter)
+            .GroupBy(parameter => (ElementId: parameter.Element?.Id.Value ?? 0, ParameterId: parameter.Id.Value))
+            .Select(group => group.First())
+            .ToList();
     }
 
     private static bool TrySet(Parameter parameter, string value, out string? error)
@@ -229,7 +326,7 @@ public static class SheetParameterService
         return new FilteredElementCollector(doc)
             .OfClass(typeof(ViewSheet))
             .Cast<ViewSheet>()
-            .Where(sheet => !sheet.IsTemplate && !sheet.IsPlaceholder)
+            .Where(sheet => !sheet.IsTemplate)
             .OrderBy(sheet => sheet.SheetNumber, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
@@ -242,10 +339,10 @@ public static class SheetParameterService
         return sheets.FirstOrDefault();
     }
 
-    private static Dictionary<string, string> ReadAll(Document doc, ViewSheet sheet)
+    private static Dictionary<string, string> ReadAll(ViewSheet sheet)
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Element host in Hosts(doc, sheet))
+        foreach (Element host in Hosts(sheet))
         {
             foreach (Parameter parameter in host.Parameters)
                 Accumulate(values, parameter);
@@ -277,7 +374,7 @@ public static class SheetParameterService
     private static List<ParamHit> FindHits(Document doc, ViewSheet sheet, string parameterName)
     {
         var hits = new List<ParamHit>();
-        foreach (Element host in Hosts(doc, sheet))
+        foreach (Element host in Hosts(sheet))
         {
             Parameter? parameter = host.LookupParameter(parameterName);
             if (parameter == null || !IsListed(parameter))
@@ -317,24 +414,78 @@ public static class SheetParameterService
         return withValue ?? pool[0];
     }
 
-    private static IEnumerable<Element> Hosts(Document doc, ViewSheet sheet)
+    private static IEnumerable<Element> Hosts(ViewSheet sheet)
     {
-        foreach (Element titleBlock in new FilteredElementCollector(doc, sheet.Id)
+        yield return sheet;
+
+        foreach (Element titleBlock in new FilteredElementCollector(sheet.Document, sheet.Id)
                      .OfCategory(BuiltInCategory.OST_TitleBlocks)
                      .WhereElementIsNotElementType())
         {
             yield return titleBlock;
         }
+    }
 
-        yield return sheet;
+    private static IReadOnlySet<string> CollectSheetParameterNames(Document doc, ViewSheet? sheet)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (sheet == null)
+            return names;
 
-        if (doc.ProjectInformation != null)
-            yield return doc.ProjectInformation;
+        var otherViewNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        View? otherView = new FilteredElementCollector(doc)
+            .OfClass(typeof(View))
+            .Cast<View>()
+            .FirstOrDefault(view => view is not ViewSheet && !view.IsTemplate);
+        if (otherView != null)
+            CollectNames(otherView, otherViewNames);
+
+        foreach (Parameter parameter in sheet.GetOrderedParameters())
+        {
+            if (!IsListed(parameter))
+                continue;
+
+            string name = parameter.Definition.Name;
+            bool sheetBuiltIn = IsBuiltInSheetNumber(parameter);
+            if (sheetBuiltIn || !otherViewNames.Contains(name))
+                names.Add(name);
+        }
+
+        Category? sheets = Category.GetCategory(doc, BuiltInCategory.OST_Sheets);
+        if (sheets == null)
+            return names;
+
+        DefinitionBindingMapIterator iterator = doc.ParameterBindings.ForwardIterator();
+        while (iterator.MoveNext())
+        {
+            if (iterator.Key is not Definition definition || string.IsNullOrWhiteSpace(definition.Name))
+                continue;
+            if (iterator.Current is not ElementBinding binding || !IsBoundOnlyToSheets(binding, sheets))
+                continue;
+
+            names.Add(definition.Name);
+        }
+
+        return names;
+    }
+
+    private static bool IsBoundOnlyToSheets(ElementBinding binding, Category sheets)
+    {
+        bool includesSheets = false;
+        foreach (Category category in binding.Categories)
+        {
+            if (category.Id == sheets.Id)
+                includesSheets = true;
+            else
+                return false;
+        }
+
+        return includesSheets;
     }
 
     private static void CollectNames(Element element, ISet<string> names)
     {
-        foreach (Parameter parameter in element.Parameters)
+        foreach (Parameter parameter in element.GetOrderedParameters())
         {
             if (IsListed(parameter))
                 names.Add(parameter.Definition.Name);
@@ -402,6 +553,11 @@ public static class SheetParameterService
         }
     }
 
+    private static bool NamesEqual(string left, string right)
+    {
+        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string SheetLabel(ViewSheet sheet)
     {
         string number = sheet.SheetNumber?.Trim() ?? "";
@@ -411,6 +567,22 @@ public static class SheetParameterService
         if (name.Length == 0)
             return number;
         return $"{number} — {name}";
+    }
+
+    private sealed class SheetPlan
+    {
+        public required ViewSheet Sheet { get; init; }
+        public required string Label { get; init; }
+        public required string OriginalSheetNumber { get; init; }
+        public UpdateStatus Status { get; set; }
+        public string? Failure { get; set; }
+        public bool WriteDestination { get; set; }
+        public string DestinationValue { get; set; } = "";
+        public List<Parameter> DestinationParameters { get; set; } = [];
+        public bool SetSheetNumber { get; set; }
+        public string NewSheetNumber { get; set; } = "";
+        public List<Parameter> TargetParameters { get; set; } = [];
+        public string TargetValue { get; set; } = "";
     }
 
     private enum UpdateStatus

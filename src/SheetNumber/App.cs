@@ -30,8 +30,8 @@ public class App : IExternalApplication
             AssemblyPath,
             "SheetNumber.Commands.UpdateSheetNumberCommand")
         {
-            ToolTip = "Copy the sheet number, then add two sheet parameters to the front of it.",
-            LongDescription = "Saves the current main parameter into a destination parameter, then joins two chosen parameters and places them at the start of the main parameter.",
+            ToolTip = "Read a sheet parameter, add two parameters to the front, and write the result to a destination parameter.",
+            LongDescription = "Reads the main parameter, joins two chosen parameters in front of that value, and writes the result to the destination parameter.",
             AvailabilityClassName = "SheetNumber.Commands.ProjectDocumentAvailability"
         };
 
